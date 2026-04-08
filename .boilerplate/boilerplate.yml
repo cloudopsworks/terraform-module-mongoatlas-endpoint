@@ -1,0 +1,48 @@
+##
+# (c) 2021-2026
+#     Cloud Ops Works LLC - https://cloudops.works/
+#     Find us on:
+#       GitHub: https://github.com/cloudopsworks
+#       WebSite: https://cloudops.works
+#     Distributed Under Apache v2.0 License
+#
+# Terragrunt Boilerplate Configuration
+variables:
+  # Generic Boilerplate Variables Setup
+  - name: is_hub
+    order: 0
+    description: "Is this a hub configuration?"
+    type: bool
+    default: false
+  - name: tags
+    order: 1
+    description: "Tags"
+    type: map
+    default: {}
+  # End - Generic Boilerplate Variables Setup
+  - name: atlas_container
+    order: 2
+    description: "Atlas Container Dependency is enabled?"
+    type: bool
+    default: true
+  - name: atlas_container_path
+    order: 3
+    description: "Atlas Container Path, required if atlas_container is true"
+    type: string
+    default: "../network-container"
+  - name: project
+    order: 4
+    description: "Project Dependency is enabled?"
+    type: bool
+    default: true
+  - name: project_path
+    order: 5
+    description: "Project Path, required if project is true"
+    type: string
+    default: "../project"
+
+hooks:
+  after:
+    - command: "git"
+      args: ["add", "."]
+      dir: "{{ outputFolder }}"
