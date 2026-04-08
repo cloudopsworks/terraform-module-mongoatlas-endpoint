@@ -18,20 +18,232 @@ copyrights:
 github_repo: cloudopsworks/terraform-module-mongoatlas-endpoint
 
 description: |-
-  MongoDB Atlas Endpoint Module for setting up private endpoints for MongoDB Atlas clusters.
+  Terraform module for provisioning a MongoDB Atlas PrivateLink endpoint. Discovers an existing
+  Atlas network container to infer the cloud provider and region, then creates the corresponding
+  `mongodbatlas_privatelink_endpoint` resource. The Atlas project may be referenced by ID or name.
 
 # Introduction to the project
 introduction: |-
-#  This is an introduction.
+  This module automates the creation of a [MongoDB Atlas PrivateLink endpoint](https://www.mongodb.com/docs/atlas/security-private-endpoint/)
+  by leveraging an existing Atlas network container. It resolves the target project either by a
+  supplied project ID or by performing a name-based lookup, and derives the cloud provider and
+  region directly from the network container — removing the need to hard-code those values.
+
+  ### Key features
+
+  - Supports project lookup by **ID** or by **name** (mutually exclusive)
+  - Automatically infers **cloud provider** (`AWS`, `AZURE`, `GCP`) and **region** from the Atlas
+    network container
+  - Emits the PrivateLink **ID**, **service name**, and **status** as outputs for downstream use
+    (e.g., creating the cloud-side VPC/private endpoint)
+  - Follows CloudOps Works tagging and naming conventions via the `cloudopsworks/tags/local` module
+
+  ### Prerequisites
+
+  - Terraform `>= 1.7`
+  - MongoDB Atlas provider `~> 2.1`
+  - An existing MongoDB Atlas network container (created by a companion module such as
+    `terraform-module-mongoatlas-container`)
+  - Atlas API credentials configured via AWS Secrets Manager (STS role ARN + secret name)
 
 # How to use this project
 usage: |-
+  The module is designed to be consumed through **Terragrunt**. A typical directory layout
+  places this configuration alongside a companion `atlas-network-container` module and an
+  `atlas-project` module.
+
+  **`terragrunt.hcl`**
+
+  ```hcl
+  locals {
+    local_vars  = yamldecode(file("./inputs.yaml"))
+    spoke_vars  = yamldecode(file(find_in_parent_folders("spoke-inputs.yaml")))
+    region_vars = yamldecode(file(find_in_parent_folders("region-inputs.yaml")))
+    env_vars    = yamldecode(file(find_in_parent_folders("env-inputs.yaml")))
+    global_vars = yamldecode(file(find_in_parent_folders("global-inputs.yaml")))
+
+    local_tags  = jsondecode(file("./local-tags.json"))
+    spoke_tags  = jsondecode(file(find_in_parent_folders("spoke-tags.json")))
+    region_tags = jsondecode(file(find_in_parent_folders("region-tags.json")))
+    env_tags    = jsondecode(file(find_in_parent_folders("env-tags.json")))
+    global_tags = jsondecode(file(find_in_parent_folders("global-tags.json")))
+
+    tags = merge(
+      local.global_tags,
+      local.env_tags,
+      local.region_tags,
+      local.spoke_tags,
+      local.local_tags
+    )
+  }
+
+  include "root" {
+    path = find_in_parent_folders("root.hcl")
+  }
+
+  # Generates the MongoDB Atlas provider block at plan/apply time using credentials
+  # stored in AWS Secrets Manager (STS-based authentication).
+  generate "provider-mongoatlas" {
+    path      = "provider-mongoatlas.g.tf"
+    if_exists = "overwrite_terragrunt"
+    contents  = <<EOF
+  provider "mongodbatlas" {
+    assume_role {
+      role_arn = "${local.global_vars.mongodb_atlas.secrets.sts_role_arn}"
+    }
+    secret_name = "${local.global_vars.mongodb_atlas.secrets.name}"
+    region      = "${local.global_vars.mongodb_atlas.secrets.region}"
+  }
+  EOF
+  }
+
+  dependency "atlascontainer" {
+    config_path = "../atlas-network-container"
+
+    mock_outputs_allowed_terraform_commands = ["validate", "destroy"]
+    mock_outputs = {
+      network_container_id = "5e2211c17a3e5a48f5497de3"
+    }
+  }
+
+  dependency "project" {
+    config_path = "../atlas-project"
+
+    mock_outputs_allowed_terraform_commands = ["validate", "destroy"]
+    mock_outputs = {
+      project_id = "5e1b39a5e4f9b74b7d8b456c"
+    }
+  }
+
+  terraform {
+    source = "git::https://github.com/cloudopsworks/terraform-module-mongoatlas-endpoint.git?ref=v1.0.0"
+  }
+
+  inputs = {
+    is_hub    = false
+    org       = local.env_vars.org
+    spoke_def = local.spoke_vars.spoke
+
+    # Atlas network container supplying the provider + region for the endpoint
+    atlas_container_id = dependency.atlascontainer.outputs.network_container_id
+
+    # Provide EITHER project_id OR project_name — not both
+    project_id = dependency.project.outputs.project_id
+    # project_name = local.local_vars.project_name  # alternative: lookup by name
+
+    extra_tags = local.tags
+  }
+  ```
+
+  **`inputs.yaml`** (local overrides when not using a project dependency)
+
+  ```yaml
+  # atlas_container_id is supplied via the atlascontainer dependency above.
+  # Uncomment project_name below if not using a project dependency.
+  # project_name: "my-atlas-project"
+  ```
+
+  ### Module variables
+
+  | Variable | Type | Required | Description |
+  |---|---|---|---|
+  | `org` | `object` | Yes | Organisation/environment metadata used for tagging and naming |
+  | `org.organization_name` | `string` | Yes | Full organisation name |
+  | `org.organization_unit` | `string` | Yes | Business/team unit abbreviation |
+  | `org.environment_type` | `string` | Yes | Environment type (e.g. `production`, `staging`) |
+  | `org.environment_name` | `string` | Yes | Short environment name (e.g. `prod`, `stg`) |
+  | `atlas_container_id` | `string` | Yes | ID of the existing MongoDB Atlas network container |
+  | `project_id` | `string` | No | MongoDB Atlas project ID. Mutually exclusive with `project_name`. Default: `""` |
+  | `project_name` | `string` | No | MongoDB Atlas project name for ID lookup. Mutually exclusive with `project_id`. Default: `""` |
+  | `is_hub` | `bool` | No | Whether this is a hub (vs spoke) configuration. Default: `false` |
+  | `spoke_def` | `string` | No | Spoke identifier suffix used in resource naming. Default: `"001"` |
+  | `extra_tags` | `map(string)` | No | Additional tags merged with the standard tag set. Default: `{}` |
+
+  ### Outputs
+
+  | Output | Description |
+  |---|---|
+  | `endpoint_privatelink_id` | The PrivateLink ID returned by MongoDB Atlas (used to create the cloud-side endpoint) |
+  | `endpoint_privatelink_service_name` | The endpoint service name (AWS VPC endpoint service or Azure private link service) |
+  | `endpoint_status` | Current status of the PrivateLink endpoint (`INITIATING`, `AVAILABLE`, `WAITING_FOR_USER`, `FAILED`, `DELETING`) |
 
 # Example usage
 examples: |-
+  ### Example: AWS PrivateLink endpoint (project referenced by ID)
+
+  ```hcl
+  inputs = {
+    is_hub    = false
+    org = {
+      organization_name = "Acme Corp"
+      organization_unit = "platform"
+      environment_type  = "production"
+      environment_name  = "prod"
+    }
+    spoke_def = "001"
+
+    atlas_container_id = dependency.atlascontainer.outputs.network_container_id
+    project_id         = dependency.project.outputs.project_id
+
+    extra_tags = { "CostCenter" = "12345" }
+  }
+  ```
+
+  ### Example: Lookup project by name (no project dependency)
+
+  ```hcl
+  inputs = {
+    is_hub    = false
+    org = {
+      organization_name = "Acme Corp"
+      organization_unit = "platform"
+      environment_type  = "staging"
+      environment_name  = "stg"
+    }
+    spoke_def = "001"
+
+    atlas_container_id = dependency.atlascontainer.outputs.network_container_id
+    project_name       = "acme-staging-project"
+
+    extra_tags = {}
+  }
+  ```
 
 # How to get started quickly
 quickstart: |-
+  1. **Initialise the module** in your implementation repository (MongoDB Atlas boilerplate):
+     ```sh
+     make init/mongodb
+     ```
+
+  2. **Create your Terragrunt layout**:
+     ```
+     envs/
+       prod/
+         us-east-1/
+           spoke-001/
+             atlas-network-container/   # prerequisite module
+             atlas-project/             # prerequisite module
+             atlas-endpoint/
+               terragrunt.hcl           # based on .boilerplate/terragrunt.hcl
+               inputs.yaml
+               local-tags.json
+     ```
+
+  3. **Copy and customise** `.boilerplate/terragrunt.hcl` into your `atlas-endpoint/` directory.
+     Update the `dependency` paths and the `terraform.source` ref to point at the desired release tag.
+
+  4. **Validate and apply**:
+     ```sh
+     make fmt
+     make lint
+     terragrunt plan
+     terragrunt apply
+     ```
+
+  5. **Use the outputs** in the cloud-side endpoint module (e.g., AWS VPC Endpoint):
+     - `endpoint_privatelink_id` → pass to your AWS/Azure/GCP endpoint resource as the service ID
+     - `endpoint_privatelink_service_name` → pass as the VPC endpoint service name
 
 include:
   - "docs/targets.md"
